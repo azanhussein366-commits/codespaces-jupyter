@@ -1,0 +1,398 @@
+# ===============================================================
+# RIS-ML V4.3 — Physics-Constrained Transformer (FINAL)
+# Complex-Valued Output to Resolve Phase Ambiguity
+# ===============================================================
+
+import os, math, time, warnings
+import numpy as np
+warnings.filterwarnings("ignore")
+
+!pip install einops -q
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import KFold
+
+import matplotlib
+matplotlib.use("Agg")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("🔥 DEVICE:", device)
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
+# ===================== CONFIG =====================
+class CFG:
+    N_RIS = 32
+    N_ANT = 8
+
+    SAMPLE_TARGET = 150_000
+    CHUNK = 25_000
+
+    D_MODEL = 256
+    N_HEAD = 4
+    N_LAYERS = 6
+    DROPOUT = 0.1
+
+    BATCH = 256
+    EPOCHS = 35
+    LR = 2e-4
+    WARMUP = 5
+
+    X_FILE = "X_mm_v42.npy"
+    Y_FILE = "Y_mm_v42.npy"
+
+cfg = CFG
+
+# ===================== CHANNEL =====================
+def realistic_channel(b, n_ris, n_ant):
+    K = np.random.uniform(6, 15, size=(b,1,1))
+    AoA = np.random.uniform(0, 2*np.pi, size=b)
+
+    steering = np.exp(1j*np.outer(AoA, np.arange(n_ris)))
+    H_los = steering[:,:,None] @ np.ones((1,1,n_ant))
+    H_nlos = (np.random.randn(b,n_ris,n_ant)+1j*np.random.randn(b,n_ris,n_ant))/np.sqrt(2)
+
+    H = np.sqrt(K/(K+1))*H_los + np.sqrt(1/(K+1))*H_nlos
+
+    d = np.arange(n_ris)
+    corr = np.exp(-0.05*np.abs(d[:,None]-d[None,:]))
+    L = np.linalg.cholesky(corr)
+    for i in range(b):
+        H[i] = L @ H[i]
+    return H
+
+# ===================== MEMMAP =====================
+def generate_memmap(cfg):
+    if os.path.exists(cfg.X_FILE):
+        print("Using existing memmap.")
+        return
+
+    X = np.memmap(cfg.X_FILE, "float32", "w+",
+                  shape=(cfg.SAMPLE_TARGET, cfg.N_RIS, 2*cfg.N_ANT))
+    Y = np.memmap(cfg.Y_FILE, "float32", "w+",
+                  shape=(cfg.SAMPLE_TARGET, cfg.N_RIS, 2))
+
+    done = 0
+    while done < cfg.SAMPLE_TARGET:
+        b = min(cfg.CHUNK, cfg.SAMPLE_TARGET-done)
+        H = realistic_channel(b, cfg.N_RIS, cfg.N_ANT)
+
+        Xb = np.concatenate([H.real, H.imag], axis=2)
+        S = np.sum(H, axis=2)
+        Yb = np.stack([np.cos(np.angle(S)), np.sin(np.angle(S))], axis=2)
+
+        X[done:done+b] = Xb
+        Y[done:done+b] = Yb
+        done += b
+        print(done,"/",cfg.SAMPLE_TARGET)
+
+    del X,Y
+
+# ===================== MODEL =====================
+class PhysicsTransformer(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.embed = nn.Linear(2*cfg.N_ANT, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+        enc = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=cfg.N_HEAD,
+            batch_first=True,
+            dropout=cfg.DROPOUT
+        )
+        self.encoder = nn.TransformerEncoder(enc, cfg.N_LAYERS)
+
+        self.head = nn.Linear(d_model, 2)
+
+    def forward(self, x):
+        x = self.norm(self.embed(x))
+        z = self.encoder(x)
+        z = self.head(z)
+        z = z / torch.norm(z, dim=-1, keepdim=True)
+        return z
+
+# ===================== LOSS =====================
+def complex_loss(pred, true):
+    return nn.functional.mse_loss(pred, true)
+
+# ===================== TRAIN =====================
+def train_epoch(model, loader, opt, ep):
+    model.train()
+    total = 0
+    for x,y in loader:
+        x,y = x.to(device), y.to(device)
+        opt.zero_grad()
+        z = model(x)
+        loss = complex_loss(z,y)
+        loss.backward()
+        opt.step()
+        total += loss.item()*x.size(0)
+    return total/len(loader.dataset)
+
+# ===================== EVAL =====================
+def evaluate(model, loader):
+    model.eval()
+    preds, trues = [], []
+    with torch.no_grad():
+        for x,y in loader:
+            z = model(x.to(device))
+            preds.append(z.cpu().numpy())
+            trues.append(y.numpy())
+
+    Zp = np.vstack(preds)
+    Zt = np.vstack(trues)
+
+    phi_p = np.arctan2(Zp[...,1], Zp[...,0])
+    phi_t = np.arctan2(Zt[...,1], Zt[...,0])
+
+    err = np.abs(np.angle(np.exp(1j*(phi_p-phi_t))))*180/np.pi
+
+    metrics = {
+        "mean": float(err.mean()),
+        "median": float(np.median(err)),
+        "rmse": float(np.sqrt((err**2).mean()))
+    }
+    for t in [1,2,5,10,20]:
+        metrics[f"succ_{t}"] = float((err<t).mean()*100)
+    return metrics
+
+# ===================== MAIN =====================
+def main():
+    generate_memmap(cfg)
+
+    X = np.memmap(cfg.X_FILE,"float32","r").reshape(-1,cfg.N_RIS,2*cfg.N_ANT)
+    Y = np.memmap(cfg.Y_FILE,"float32","r").reshape(-1,cfg.N_RIS,2)
+
+    kf = KFold(n_splits=3, shuffle=True, random_state=42)
+
+    for f,(tr,va) in enumerate(kf.split(X)):
+        print(f"\n===== FOLD {f+1} =====")
+
+        tr_ds = TensorDataset(torch.tensor(X[tr]), torch.tensor(Y[tr]))
+        va_ds = TensorDataset(torch.tensor(X[va]), torch.tensor(Y[va]))
+
+        tr_ld = DataLoader(tr_ds, batch_size=cfg.BATCH, shuffle=True)
+        va_ld = DataLoader(va_ds, batch_size=cfg.BATCH)
+
+        model = PhysicsTransformer(cfg.D_MODEL).to(device)
+        opt = optim.AdamW(model.parameters(), lr=cfg.LR)
+
+        for ep in range(cfg.EPOCHS):
+            if ep < cfg.WARMUP:
+                lr = cfg.LR*(ep+1)/cfg.WARMUP
+                for g in opt.param_groups: g["lr"]=lr
+
+            loss = train_epoch(model, tr_ld, opt, ep)
+            print(f"Epoch {ep+1}: loss={loss:.4f}")
+
+        metrics = evaluate(model, va_ld)
+        print("FINAL:", metrics)
+
+    print("\n🎉 RIS-ML V4.3 COMPLETE")
+
+main()
+# ===============================================================
+# RIS-ML V4.3 — Physics-Constrained Transformer (FINAL)
+# Complex-Valued Output to Resolve Phase Ambiguity
+# ===============================================================
+
+import os, math, time, warnings
+import numpy as np
+warnings.filterwarnings("ignore")
+
+!pip install einops -q
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import KFold
+
+import matplotlib
+matplotlib.use("Agg")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("🔥 DEVICE:", device)
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
+# ===================== CONFIG =====================
+class CFG:
+    N_RIS = 32
+    N_ANT = 8
+
+    SAMPLE_TARGET = 150_000
+    CHUNK = 25_000
+
+    D_MODEL = 256
+    N_HEAD = 4
+    N_LAYERS = 6
+    DROPOUT = 0.1
+
+    BATCH = 256
+    EPOCHS = 35
+    LR = 2e-4
+    WARMUP = 5
+
+    X_FILE = "X_mm_v42.npy"
+    Y_FILE = "Y_mm_v42.npy"
+
+cfg = CFG
+
+# ===================== CHANNEL =====================
+def realistic_channel(b, n_ris, n_ant):
+    K = np.random.uniform(6, 15, size=(b,1,1))
+    AoA = np.random.uniform(0, 2*np.pi, size=b)
+
+    steering = np.exp(1j*np.outer(AoA, np.arange(n_ris)))
+    H_los = steering[:,:,None] @ np.ones((1,1,n_ant))
+    H_nlos = (np.random.randn(b,n_ris,n_ant)+1j*np.random.randn(b,n_ris,n_ant))/np.sqrt(2)
+
+    H = np.sqrt(K/(K+1))*H_los + np.sqrt(1/(K+1))*H_nlos
+
+    d = np.arange(n_ris)
+    corr = np.exp(-0.05*np.abs(d[:,None]-d[None,:]))
+    L = np.linalg.cholesky(corr)
+    for i in range(b):
+        H[i] = L @ H[i]
+    return H
+
+# ===================== MEMMAP =====================
+def generate_memmap(cfg):
+    if os.path.exists(cfg.X_FILE):
+        print("Using existing memmap.")
+        return
+
+    X = np.memmap(cfg.X_FILE, "float32", "w+",
+                  shape=(cfg.SAMPLE_TARGET, cfg.N_RIS, 2*cfg.N_ANT))
+    Y = np.memmap(cfg.Y_FILE, "float32", "w+",
+                  shape=(cfg.SAMPLE_TARGET, cfg.N_RIS, 2))
+
+    done = 0
+    while done < cfg.SAMPLE_TARGET:
+        b = min(cfg.CHUNK, cfg.SAMPLE_TARGET-done)
+        H = realistic_channel(b, cfg.N_RIS, cfg.N_ANT)
+
+        Xb = np.concatenate([H.real, H.imag], axis=2)
+        S = np.sum(H, axis=2)
+        Yb = np.stack([np.cos(np.angle(S)), np.sin(np.angle(S))], axis=2)
+
+        X[done:done+b] = Xb
+        Y[done:done+b] = Yb
+        done += b
+        print(done,"/",cfg.SAMPLE_TARGET)
+
+    del X,Y
+
+# ===================== MODEL =====================
+class PhysicsTransformer(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.embed = nn.Linear(2*cfg.N_ANT, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+        enc = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=cfg.N_HEAD,
+            batch_first=True,
+            dropout=cfg.DROPOUT
+        )
+        self.encoder = nn.TransformerEncoder(enc, cfg.N_LAYERS)
+
+        self.head = nn.Linear(d_model, 2)
+
+    def forward(self, x):
+        x = self.norm(self.embed(x))
+        z = self.encoder(x)
+        z = self.head(z)
+        z = z / torch.norm(z, dim=-1, keepdim=True)
+        return z
+
+# ===================== LOSS =====================
+def complex_loss(pred, true):
+    return nn.functional.mse_loss(pred, true)
+
+# ===================== TRAIN =====================
+def train_epoch(model, loader, opt, ep):
+    model.train()
+    total = 0
+    for x,y in loader:
+        x,y = x.to(device), y.to(device)
+        opt.zero_grad()
+        z = model(x)
+        loss = complex_loss(z,y)
+        loss.backward()
+        opt.step()
+        total += loss.item()*x.size(0)
+    return total/len(loader.dataset)
+
+# ===================== EVAL =====================
+def evaluate(model, loader):
+    model.eval()
+    preds, trues = [], []
+    with torch.no_grad():
+        for x,y in loader:
+            z = model(x.to(device))
+            preds.append(z.cpu().numpy())
+            trues.append(y.numpy())
+
+    Zp = np.vstack(preds)
+    Zt = np.vstack(trues)
+
+    phi_p = np.arctan2(Zp[...,1], Zp[...,0])
+    phi_t = np.arctan2(Zt[...,1], Zt[...,0])
+
+    err = np.abs(np.angle(np.exp(1j*(phi_p-phi_t))))*180/np.pi
+
+    metrics = {
+        "mean": float(err.mean()),
+        "median": float(np.median(err)),
+        "rmse": float(np.sqrt((err**2).mean()))
+    }
+    for t in [1,2,5,10,20]:
+        metrics[f"succ_{t}"] = float((err<t).mean()*100)
+    return metrics
+
+# ===================== MAIN =====================
+def main():
+    generate_memmap(cfg)
+
+    X = np.memmap(cfg.X_FILE,"float32","r").reshape(-1,cfg.N_RIS,2*cfg.N_ANT)
+    Y = np.memmap(cfg.Y_FILE,"float32","r").reshape(-1,cfg.N_RIS,2)
+
+    kf = KFold(n_splits=3, shuffle=True, random_state=42)
+
+    for f,(tr,va) in enumerate(kf.split(X)):
+        print(f"\n===== FOLD {f+1} =====")
+
+        tr_ds = TensorDataset(torch.tensor(X[tr]), torch.tensor(Y[tr]))
+        va_ds = TensorDataset(torch.tensor(X[va]), torch.tensor(Y[va]))
+
+        tr_ld = DataLoader(tr_ds, batch_size=cfg.BATCH, shuffle=True)
+        va_ld = DataLoader(va_ds, batch_size=cfg.BATCH)
+
+        model = PhysicsTransformer(cfg.D_MODEL).to(device)
+        opt = optim.AdamW(model.parameters(), lr=cfg.LR)
+
+        for ep in range(cfg.EPOCHS):
+            if ep < cfg.WARMUP:
+                lr = cfg.LR*(ep+1)/cfg.WARMUP
+                for g in opt.param_groups: g["lr"]=lr
+
+            loss = train_epoch(model, tr_ld, opt, ep)
+            print(f"Epoch {ep+1}: loss={loss:.4f}")
+
+        metrics = evaluate(model, va_ld)
+        print("FINAL:", metrics)
+
+    print("\n🎉 RIS-ML V4.3 COMPLETE")
+
+main()
